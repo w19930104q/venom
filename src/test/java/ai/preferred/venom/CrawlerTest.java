@@ -18,6 +18,7 @@ package ai.preferred.venom;
 
 import ai.preferred.venom.fetcher.FakeFetcher;
 import ai.preferred.venom.fetcher.Fetcher;
+import ai.preferred.venom.fetcher.RecordingFetcher;
 import ai.preferred.venom.job.FIFOJobQueue;
 import ai.preferred.venom.job.LazyPriorityJobQueue;
 import ai.preferred.venom.request.Request;
@@ -390,6 +391,123 @@ public class CrawlerTest {
     }
 
     Assertions.assertEquals(3, fetcher.getCounter());
+  }
+
+  @Test
+  public void testFairHostSharingDisabledByDefault() throws Exception {
+    final LinkedList<FakeFetcher.Status> statuses = new LinkedList<>();
+    statuses.add(FakeFetcher.Status.COMPLETE);
+
+    final FakeFetcher fetcher = new FakeFetcher(statuses);
+    try (final Crawler crawler = Crawler.builder()
+        .setFetcher(fetcher)
+        .setMaxTries(1)
+        .setMaxConnections(1)
+        .setSleepScheduler(new SleepScheduler(0))
+        .build()
+        .start()) {
+
+      crawler.getScheduler().add(vRequest, handler);
+    }
+
+    Assertions.assertEquals(1, fetcher.getCounter());
+  }
+
+  @Test
+  public void testFairHostSharingInterleavesHosts() throws Exception {
+    final int total = 6;
+    final LinkedList<FakeFetcher.Status> statuses = new LinkedList<>();
+    for (int i = 0; i < total; i++) {
+      statuses.add(FakeFetcher.Status.COMPLETE);
+    }
+    final RecordingFetcher fetcher = new RecordingFetcher(new FakeFetcher(statuses));
+
+    try (final Crawler crawler = Crawler.builder()
+        .setFetcher(fetcher)
+        .setMaxConnections(1)
+        .setMaxTries(1)
+        .setFairHostSharing(true)
+        .setSleepScheduler(new SleepScheduler(0))
+        .build()
+        .start()) {
+
+      // A hot host enqueues four jobs while the slow host enqueues two.
+      crawler.getScheduler().add(new VRequest("https://hot.example.com/1"), handler);
+      crawler.getScheduler().add(new VRequest("https://slow.example.com/1"), handler);
+      crawler.getScheduler().add(new VRequest("https://hot.example.com/2"), handler);
+      crawler.getScheduler().add(new VRequest("https://hot.example.com/3"), handler);
+      crawler.getScheduler().add(new VRequest("https://slow.example.com/2"), handler);
+      crawler.getScheduler().add(new VRequest("https://hot.example.com/4"), handler);
+    }
+
+    Assertions.assertEquals(total, fetcher.getFetchedUrls().size());
+    // The slow host is served in the first round and again before the hot host finishes.
+    Assertions.assertEquals("https://slow.example.com/1", fetcher.getFetchedUrls().get(1));
+    Assertions.assertEquals("https://slow.example.com/2", fetcher.getFetchedUrls().get(3));
+    // While both hosts still have pending jobs, no host is served twice in a row.
+    for (int i = 1; i < 4; i++) {
+      Assertions.assertNotEquals(
+          hostOf(fetcher.getFetchedUrls().get(i - 1)),
+          hostOf(fetcher.getFetchedUrls().get(i))
+      );
+    }
+    // Once the slow host is drained, the remaining hot-host jobs are still all processed.
+    Assertions.assertEquals(4, fetcher.getFetchedUrls().stream()
+        .filter(url -> "hot.example.com".equals(hostOf(url))).count());
+  }
+
+  @Test
+  public void testFairHostSharingRetriesDoNotLeakSlots() throws Exception {
+    // One failure then a success for the retried job, plus two successful jobs of another host.
+    final LinkedList<FakeFetcher.Status> statuses = new LinkedList<>(Arrays.asList(
+        FakeFetcher.Status.FAILED,
+        FakeFetcher.Status.COMPLETE,
+        FakeFetcher.Status.COMPLETE,
+        FakeFetcher.Status.COMPLETE));
+    final RecordingFetcher fetcher = new RecordingFetcher(new FakeFetcher(statuses));
+
+    try (final Crawler crawler = Crawler.builder()
+        .setFetcher(fetcher)
+        .setMaxConnections(1)
+        .setMaxTries(3)
+        .setFairHostSharing(true)
+        .setSleepScheduler(new SleepScheduler(0))
+        .build()
+        .start()) {
+
+      crawler.getScheduler().add(new VRequest("https://retry.example.com/1"), handler);
+      crawler.getScheduler().add(new VRequest("https://other.example.com/1"), handler);
+      crawler.getScheduler().add(new VRequest("https://other.example.com/2"), handler);
+    }
+
+    // A leaked slot would leave the retried job stuck and the crawler would time out.
+    Assertions.assertEquals(4, fetcher.getFetchedUrls().size());
+    Assertions.assertTrue(fetcher.getFetchedUrls().contains("https://retry.example.com/1"));
+  }
+
+  @Test
+  public void testFairHostSharingCancellationReleasesSlots() throws Exception {
+    final LinkedList<FakeFetcher.Status> statuses = new LinkedList<>();
+    statuses.add(FakeFetcher.Status.COMPLETE);
+    final FakeFetcher fetcher = new FakeFetcher(statuses);
+
+    final Crawler crawler = Crawler.builder()
+        .setFetcher(fetcher)
+        .setMaxTries(1)
+        .setMaxConnections(1)
+        .setFairHostSharing(true)
+        .setSleepScheduler(new SleepScheduler(0))
+        .build()
+        .start();
+
+    crawler.interruptAndClose();
+    // Queuing after interruption must not block or leak a slot.
+    crawler.getScheduler().add(vRequest, handler);
+    Assertions.assertEquals(0, fetcher.getCounter());
+  }
+
+  private static String hostOf(final String url) {
+    return java.net.URI.create(url).getHost();
   }
 
 }

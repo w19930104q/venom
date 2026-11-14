@@ -76,6 +76,12 @@ public class CrawlerBuilderTest {
   }
 
   @Test
+  void testSetFairHostSharing() {
+    Crawler.builder().setFairHostSharing(true);
+    Crawler.builder().setFairHostSharing(false);
+  }
+
+  @Test
   void testSetSession() {
     Crawler.builder().setSession(null);
     Crawler.builder().setSession(Session.EMPTY_SESSION);

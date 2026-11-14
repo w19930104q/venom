@@ -17,7 +17,9 @@
 package ai.preferred.venom;
 
 import ai.preferred.venom.fetcher.*;
+import ai.preferred.venom.job.FairHostJobQueue;
 import ai.preferred.venom.job.Job;
+import ai.preferred.venom.job.JobSlotManager;
 import ai.preferred.venom.job.PriorityJobQueue;
 import ai.preferred.venom.job.Scheduler;
 import ai.preferred.venom.request.CrawlerRequest;
@@ -101,6 +103,13 @@ public final class Crawler implements Interruptible, AutoCloseable {
   private final Scheduler scheduler;
 
   /**
+   * The manager responsible for releasing per-host scheduling slots,
+   * or null if the job queue does not reserve slots.
+   */
+  @Nullable
+  private final JobSlotManager jobSlotManager;
+
+  /**
    * The maximum number of simultaneous connections.
    */
   @NotNull
@@ -153,8 +162,13 @@ public final class Crawler implements Interruptible, AutoCloseable {
     maxTries = builder.maxTries;
     propRetainProxy = builder.propRetainProxy;
     router = builder.router;
-    jobQueue = builder.jobQueue;
+    if (builder.fairHostSharing) {
+      jobQueue = new FairHostJobQueue(builder.jobQueue, true);
+    } else {
+      jobQueue = builder.jobQueue;
+    }
     scheduler = new Scheduler(jobQueue);
+    jobSlotManager = jobQueue instanceof JobSlotManager ? (JobSlotManager) jobQueue : null;
     connections = new Semaphore(builder.maxConnections);
     session = builder.session;
     sleepScheduler = builder.sleepScheduler;
@@ -272,7 +286,20 @@ public final class Crawler implements Interruptible, AutoCloseable {
     } catch (final Exception e) {
       LOGGER.error("An exception occurred in handler when parsing response: {}", job.getRequest().getUrl(), e);
     } finally {
+      releaseSlot(job);
       jobsPending.decrementAndGet();
+    }
+  }
+
+  /**
+   * Release the per-host scheduling slot held by a finished, cancelled
+   * or re-queued job. This is a no-op for ordinary job queues.
+   *
+   * @param job the job whose slot is to be released
+   */
+  private void releaseSlot(final Job job) {
+    if (jobSlotManager != null) {
+      jobSlotManager.releaseSlot(job);
     }
   }
 
@@ -287,14 +314,17 @@ public final class Crawler implements Interruptible, AutoCloseable {
         || ex instanceof StopCodeException
         || ex instanceof CancellationException) {
       jobsPending.decrementAndGet();
+      releaseSlot(job);
     } else {
       synchronized (jobsPending) { // Synchronisation required to prevent crawler stopping incorrectly.
         jobsPending.decrementAndGet();
         if (job.getTryCount() < maxTries) {
           job.prepareRetry();
+          releaseSlot(job);
           jobQueue.add(job);
           LOGGER.debug("Job {} - {} re-queued.", Integer.toHexString(job.hashCode()), job.getRequest().getUrl());
         } else {
+          releaseSlot(job);
           LOGGER.error("Max retries reached for request: {}", job.getRequest().getUrl());
         }
       }
@@ -335,6 +365,7 @@ public final class Crawler implements Interruptible, AutoCloseable {
           final CrawlerRequest crawlerRequest = prepareRequest(job.getRequest(), job.getTryCount());
           if (Thread.currentThread().isInterrupted()) {
             connections.release();
+            releaseSlot(job);
             jobsPending.decrementAndGet();
             LOGGER.debug("The thread pool is interrupted");
             return;
@@ -594,6 +625,11 @@ public final class Crawler implements Interruptible, AutoCloseable {
     private BlockingQueue<Job> jobQueue;
 
     /**
+     * Whether per-host fair scheduling is enabled.
+     */
+    private boolean fairHostSharing;
+
+    /**
      * The sleep scheduler used.
      */
     private SleepScheduler sleepScheduler;
@@ -616,6 +652,7 @@ public final class Crawler implements Interruptible, AutoCloseable {
       propRetainProxy = 0.05;
       router = null;
       jobQueue = new PriorityJobQueue();
+      fairHostSharing = false;
       sleepScheduler = new SleepScheduler(250, 2000);
       session = Session.EMPTY_SESSION;
     }
@@ -703,6 +740,25 @@ public final class Crawler implements Interruptible, AutoCloseable {
         throw new IllegalStateException("Attribute 'jobQueue' cannot be null.");
       }
       this.jobQueue = jobQueue;
+      return this;
+    }
+
+    /**
+     * Sets whether per-host fair scheduling is enabled. Defaults to false,
+     * in which case the job queue behaves exactly as configured.
+     * <p>
+     * When enabled, the job queue is wrapped so that at most one pending
+     * job of each host is in flight at any time, and jobs of different
+     * hosts are dequeued in stable round-robin order within each priority
+     * level. This prevents a single host that produces tasks continuously
+     * from starving other hosts.
+     * </p>
+     *
+     * @param fairHostSharing {@code true} to enable per-host fair scheduling
+     * @return this
+     */
+    public Builder setFairHostSharing(final boolean fairHostSharing) {
+      this.fairHostSharing = fairHostSharing;
       return this;
     }
 

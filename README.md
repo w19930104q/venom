@@ -88,6 +88,40 @@ public class Example {
 }
 ```
 
+### Host-fair scheduling
+
+When crawling multiple sites, a single host that keeps producing subtasks can
+monopolise the queue and leave lower-priority sites waiting indefinitely.
+Enable per-host fair scheduling to interleave jobs from different hosts:
+
+```java
+Crawler crawler = Crawler.builder()
+        .setFairHostSharing(true)
+        .build();
+```
+
+With host fairness enabled, at most one pending job of each host is "in
+flight" at any time; every host therefore gets a turn before a host that
+already has a job in flight is served again. Jobs alternate between hosts in
+stable round-robin order within each priority level, while jobs of the same
+host are still ordered by priority (with stable FIFO order at equal
+priority). Seeds, lazy depth-probing requests and retries follow the same
+path, and retries keep their existing priority downgrade behaviour. Slots
+are released automatically when a job completes, is cancelled or is
+re-queued for retry, so interrupted or drained crawls do not leak
+reservations.
+
+The feature is **disabled by default**; leaving it off keeps the original
+queue behaviour unchanged. You can also use the queue directly:
+
+```java
+// fairness enabled, backed by the same priority ordering as PriorityJobQueue
+BlockingQueue<Job> queue = new FairHostJobQueue(true);
+
+// fairness disabled: delegates every operation to the underlying queue
+BlockingQueue<Job> plain = new FairHostJobQueue(new PriorityJobQueue(), false);
+```
+
 ## License
 
 [Apache License 2.0](LICENSE)
